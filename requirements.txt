@@ -1,0 +1,6 @@
+discord.py
+pillow
+requests
+python-dotenv
+Flask
+

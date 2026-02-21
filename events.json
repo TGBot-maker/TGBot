@@ -1,0 +1,22 @@
+[
+  {
+    "name": "Daily Quest Reset",
+    "time": "2026-01-28T18:37:00",
+    "channel_id": 1406567317139099690,
+    "mention": "@gamers",
+    "repeat_days": 1,
+    "reminder_sent": false,
+    "event_triggered": true,
+    "created_by": "santpal_tg"
+  },
+  {
+    "name": "Daily Quest Reset",
+    "time": "2026-01-28T18:39:00",
+    "channel_id": 1443308233249788058,
+    "mention": "@everyone",
+    "repeat_days": 1,
+    "reminder_sent": false,
+    "event_triggered": true,
+    "created_by": "santpal_tg"
+  }
+]
