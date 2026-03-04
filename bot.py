@@ -34,6 +34,7 @@ def run_flask():
 # =============== DISCORD BOT SETUP ===============
 
 load_dotenv()
+print(f"Token loaded: {'YES' if TOKEN else 'NO - TOKEN IS NONE'}")
 TOKEN = os.getenv("TOKEN")
 
 intents = discord.Intents.default()
