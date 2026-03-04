@@ -60,26 +60,6 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
-# =============== RATE LIMIT HANDLER ===============
-# Patches the Discord HTTP client to automatically retry on 429 instead of crashing
-
-_original_request = discord.http.HTTPClient.request
-
-async def _patched_request(self, *args, **kwargs):
-    while True:
-        try:
-            return await _original_request(self, *args, **kwargs)
-        except discord.HTTPException as e:
-            if e.status == 429:
-                retry_after = float(e.response.headers.get("Retry-After", 5))
-                print(f"⚠️  Rate limited by Discord. Retrying in {retry_after:.1f}s...")
-                await asyncio.sleep(retry_after + 0.5)
-            else:
-                raise
-
-discord.http.HTTPClient.request = _patched_request
-
-
 # =============== EVENT STORAGE ===============
 
 EVENTS_FILE = "events.json"
