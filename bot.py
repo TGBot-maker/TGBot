@@ -1,10 +1,10 @@
 import os
 import threading
 import asyncio
+import functools
 from datetime import datetime, timedelta
 import json
 import random
-import re
 
 import discord
 from discord.ext import commands, tasks
@@ -28,7 +28,7 @@ def home():
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
 
 
 # =============== DISCORD BOT SETUP ===============
@@ -40,7 +40,27 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# =============== RATE LIMIT HANDLER ===============
+# Patches the Discord HTTP client to automatically retry on 429 instead of crashing
+
+_original_request = discord.http.HTTPClient.request
+
+async def _patched_request(self, *args, **kwargs):
+    while True:
+        try:
+            return await _original_request(self, *args, **kwargs)
+        except discord.HTTPException as e:
+            if e.status == 429:
+                retry_after = float(e.response.headers.get("Retry-After", 5))
+                print(f"⚠️  Rate limited by Discord. Retrying in {retry_after:.1f}s...")
+                await asyncio.sleep(retry_after + 0.5)
+            else:
+                raise
+
+discord.http.HTTPClient.request = _patched_request
 
 
 # =============== EVENT STORAGE ===============
@@ -75,7 +95,8 @@ def save_xp(data):
         json.dump(data, f, indent=2)
 
 xp_data = load_xp()
-xp_cooldowns = {}  # user_id -> last message timestamp
+xp_cooldowns = {}       # user_id -> last message timestamp
+xp_save_counter = 0     # batch disk writes every 10 XP gains
 
 
 # =============== ECONOMY STORAGE ===============
@@ -93,7 +114,7 @@ def save_economy(data):
         json.dump(data, f, indent=2)
 
 economy_data = load_economy()
-daily_cooldowns = {}  # user_id -> last daily claim timestamp
+daily_cooldowns = {}    # user_id -> last daily claim timestamp
 
 
 # =============== WARNINGS STORAGE ===============
@@ -126,11 +147,9 @@ active_polls = {}
 # =============== HELPER FUNCTIONS ===============
 
 def get_level(xp):
-    """Calculate level from XP using a progressive formula"""
     return int((xp / 100) ** 0.5)
 
 def xp_for_next_level(level):
-    """XP required to reach next level"""
     return ((level + 1) ** 2) * 100
 
 def get_economy(user_id):
@@ -147,8 +166,9 @@ def get_xp_data(user_id):
 
 
 # =============== EVENT CHECKER TASK ===============
+# Runs every 2 minutes instead of 1 to reduce API call frequency
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=2)
 async def check_events():
     global events
     now = datetime.now()
@@ -161,15 +181,20 @@ async def check_events():
             channel = bot.get_channel(event["channel_id"])
             if channel:
                 mention = event["mention"]
-                await channel.send(f"⏰ **Reminder:** {mention} - Event **'{event['name']}'** starts in 10 minutes!")
+                await channel.send(
+                    f"⏰ **Reminder:** {mention} - Event **'{event['name']}'** starts in 10 minutes!"
+                )
                 event["reminder_sent"] = True
                 save_events(events)
+            await asyncio.sleep(1)  # small delay between sends
 
         if now >= event_time and not event.get("event_triggered", False):
             channel = bot.get_channel(event["channel_id"])
             if channel:
                 mention = event["mention"]
-                await channel.send(f"🔔 **EVENT NOW:** {mention} - **'{event['name']}'** is starting!")
+                await channel.send(
+                    f"🔔 **EVENT NOW:** {mention} - **'{event['name']}'** is starting!"
+                )
                 event["event_triggered"] = True
 
                 if event.get("repeat_days"):
@@ -179,9 +204,12 @@ async def check_events():
                     new_event["reminder_sent"] = False
                     new_event["event_triggered"] = False
                     events.append(new_event)
-                    await channel.send(f"📅 Next occurrence scheduled for: {next_time.strftime('%Y-%m-%d %H:%M')}")
+                    await channel.send(
+                        f"📅 Next occurrence scheduled for: {next_time.strftime('%Y-%m-%d %H:%M')}"
+                    )
 
                 save_events(events)
+            await asyncio.sleep(1)  # small delay between sends
 
         if event.get("event_triggered", False) and not event.get("repeat_days"):
             if now > event_time + timedelta(hours=24):
@@ -207,23 +235,29 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member):
-    # Welcome image
     try:
         template = Image.open("image.png").convert("RGBA")
         avatar_url = member.display_avatar.url
-        avatar_bytes = requests.get(avatar_url).content
+
+        # Run blocking HTTP call in a thread so it doesn't block the event loop
+        response = await asyncio.get_event_loop().run_in_executor(
+            None, functools.partial(requests.get, avatar_url)
+        )
+        avatar_bytes = response.content
+
         avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA")
         avatar = avatar.resize((140, 140))
         template.paste(avatar, (390, 28), avatar)
         draw = ImageDraw.Draw(template)
         font = ImageFont.truetype("pokemon-gb.ttf", 38)
-        username = member.name
-        draw.text((190, 469), username, font=font, fill=(0, 0, 0))
+        draw.text((190, 469), member.name, font=font, fill=(0, 0, 0))
         output_path = "welcome.png"
         template.save(output_path)
+
         channel = member.guild.system_channel
         if channel:
             await channel.send(file=discord.File(output_path))
+
     except Exception as e:
         print(f"Welcome image error: {e}")
         channel = member.guild.system_channel
@@ -241,7 +275,7 @@ async def on_member_join(member):
 
 @bot.event
 async def on_message(message):
-    global intruder_alert_enabled, intruder_count
+    global intruder_alert_enabled, intruder_count, xp_save_counter
 
     if message.author.bot:
         await bot.process_commands(message)
@@ -255,17 +289,16 @@ async def on_message(message):
             intruder_count += 1
 
             alerts = [
-                f"🚨🚨🚨 **RED ALERT! RED ALERT!** 🚨🚨🚨\n\nAn INTRUDER has been detected!\nMessage from **{message.author.mention}** deleted and sent to the SHADOW REALM™\nTotal intruders caught: **{intruder_count}**\n🔴 STATUS: CODE RED 🔴",
-                f"📛 **INTRUDER DETECTED** 📛\n\n*WOOP WOOP WOOP WOOP* 🚨\nMessage from {message.author.mention} has been VAPORIZED!\nIntruders neutralized: {intruder_count}\n*The council is pleased* ✨",
-                f"🛑 **HALT!** 🛑\n\nAn uninvited guest tried to speak!\n{message.author.mention}'s message was yeeted into oblivion\nIntruders caught so far: **{intruder_count}**\n*Mission: PROTECTING THE SERVER* ✓",
-                f"🔴 **INTRUDER PROTOCOL INITIATED** 🔴\n\nBEEP BEEP BEEP 🚨\n{message.author.mention}...\n⚙️ Scanning... ⚙️\n🎯 **IDENTIFIED AS INTRUDER**\nMessage deleted. Total bounties: {intruder_count}",
-                f"😤 **AN INTRUDER IN MY PRESENCE?!** 😤\n\n{message.author.mention} tried to pull a fast one...\nNOPE! Message OBLITERATED!\nCaught: {intruder_count} intruders\n*All is well in the kingdom* 👑"
+                f"🚨🚨🚨 **RED ALERT!** 🚨🚨🚨\n\nAn INTRUDER has been detected!\nMessage from **{message.author.mention}** deleted and sent to the SHADOW REALM™\nTotal intruders caught: **{intruder_count}**",
+                f"📛 **INTRUDER DETECTED** 📛\n\n*WOOP WOOP* 🚨\nMessage from {message.author.mention} has been VAPORIZED!\nIntruders neutralized: {intruder_count}",
+                f"🛑 **HALT!** 🛑\n\n{message.author.mention}'s message was yeeted into oblivion\nIntruders caught: **{intruder_count}**",
+                f"😤 **AN INTRUDER?!** 😤\n\n{message.author.mention} tried to pull a fast one...\nNOPE! Message OBLITERATED! Total caught: {intruder_count} 👑"
             ]
             await message.channel.send(random.choice(alerts))
             await bot.process_commands(message)
             return
 
-    # XP gain (1 message per minute cooldown)
+    # XP gain (1 minute cooldown per user)
     if message.guild:
         uid = str(message.author.id)
         now = datetime.now()
@@ -280,9 +313,16 @@ async def on_message(message):
             old_level = data["level"]
             new_level = get_level(data["xp"])
             data["level"] = new_level
-            save_xp(xp_data)
+
+            # Batch disk writes — only save every 10 XP gains
+            xp_save_counter += 1
+            if xp_save_counter >= 10:
+                save_xp(xp_data)
+                xp_save_counter = 0
 
             if new_level > old_level:
+                save_xp(xp_data)  # always save immediately on level up
+                xp_save_counter = 0
                 await message.channel.send(
                     f"🎉 **LEVEL UP!** {message.author.mention} just reached **Level {new_level}**! 🚀"
                 )
@@ -317,7 +357,8 @@ async def add_event(ctx, event_name: str, date: str, time: str, mention: str, re
 
         repeat_info = f" (repeats every {repeat_days} days)" if repeat_days > 0 else ""
         await ctx.send(
-            f"✅ Event added!\n**Event:** {event_name}\n**Time:** {event_datetime.strftime('%Y-%m-%d %H:%M')}\n**Mention:** {mention}\n**Reminder:** 10 minutes before{repeat_info}"
+            f"✅ Event added!\n**Event:** {event_name}\n**Time:** {event_datetime.strftime('%Y-%m-%d %H:%M')}\n"
+            f"**Mention:** {mention}\n**Reminder:** 10 minutes before{repeat_info}"
         )
     except ValueError:
         await ctx.send("❌ Invalid format! Use: `!addevent \"Name\" YYYY-MM-DD HH:MM @mention [days]`")
@@ -328,10 +369,6 @@ async def add_event(ctx, event_name: str, date: str, time: str, mention: str, re
 @bot.command(name="listevents")
 async def list_events(ctx):
     """List all upcoming events"""
-    if not events:
-        await ctx.send("📅 No events scheduled.")
-        return
-
     now = datetime.now()
     upcoming = sorted(
         [e for e in events if datetime.fromisoformat(e["time"]) > now],
@@ -349,7 +386,12 @@ async def list_events(ctx):
         repeat_info = f"\n🔁 Repeats every {event['repeat_days']} days" if event.get("repeat_days") else ""
         embed.add_field(
             name=f"{i}. {event['name']}",
-            value=f"⏰ {event_time.strftime('%Y-%m-%d %H:%M')}\n👥 {event['mention']}\n⏳ In {time_until.days}d {time_until.seconds//3600}h {(time_until.seconds//60)%60}m{repeat_info}",
+            value=(
+                f"⏰ {event_time.strftime('%Y-%m-%d %H:%M')}\n"
+                f"👥 {event['mention']}\n"
+                f"⏳ In {time_until.days}d {time_until.seconds//3600}h {(time_until.seconds//60)%60}m"
+                f"{repeat_info}"
+            ),
             inline=False
         )
     await ctx.send(embed=embed)
@@ -390,18 +432,18 @@ async def event_help(ctx):
 @bot.command(name="toggleintruder")
 @commands.has_permissions(manage_messages=True)
 async def toggle_intruder(ctx):
-    """Toggle the intruder alert system (requires Manage Messages permission)"""
+    """Toggle the intruder alert system (requires Manage Messages)"""
     global intruder_alert_enabled, intruder_count
 
     intruder_alert_enabled = not intruder_alert_enabled
     intruder_count = 0
 
     if intruder_alert_enabled:
-        embed = discord.Embed(title="🚨 INTRUDER ALERT ACTIVATED 🚨", description="Monitoring for intruders...", color=discord.Color.red())
+        embed = discord.Embed(title="🚨 INTRUDER ALERT ACTIVATED 🚨", color=discord.Color.red())
         embed.add_field(name="Status", value="🔴 LIVE", inline=False)
         embed.add_field(name="Action", value="Messages from the 'Intruder' role will be deleted", inline=False)
     else:
-        embed = discord.Embed(title="✅ INTRUDER ALERT DEACTIVATED", description="Intruders may roam freely...", color=discord.Color.green())
+        embed = discord.Embed(title="✅ INTRUDER ALERT DEACTIVATED", color=discord.Color.green())
         embed.add_field(name="Status", value="🟢 OFFLINE", inline=False)
         embed.add_field(name="Intruders Caught", value=f"⚡ {intruder_count}", inline=False)
 
@@ -513,10 +555,9 @@ async def image_poll(ctx, title: str, img1: str, img2: str, img3: str = None, im
 
 @bot.command(name="rank")
 async def rank(ctx, member: discord.Member = None):
-    """Check your rank or someone else's rank"""
+    """Check your rank or someone else's. Usage: !rank [@member]"""
     member = member or ctx.author
-    uid = str(member.id)
-    data = get_xp_data(uid)
+    data = get_xp_data(str(member.id))
 
     level = data["level"]
     xp = data["xp"]
@@ -541,7 +582,6 @@ async def leaderboard(ctx):
         return
 
     sorted_users = sorted(xp_data.items(), key=lambda x: x[1].get("xp", 0), reverse=True)[:10]
-
     embed = discord.Embed(title="🏆 Server Leaderboard", color=discord.Color.gold())
     medals = ["🥇", "🥈", "🥉"]
 
@@ -562,7 +602,7 @@ async def leaderboard(ctx):
 
 @bot.command(name="balance", aliases=["bal"])
 async def balance(ctx, member: discord.Member = None):
-    """Check your coin balance"""
+    """Check coin balance. Usage: !balance [@member]"""
     member = member or ctx.author
     data = get_economy(str(member.id))
     embed = discord.Embed(title=f"💰 {member.display_name}'s Balance", color=discord.Color.gold())
@@ -583,13 +623,11 @@ async def daily(ctx):
         remaining = timedelta(seconds=86400) - (now - last_claim)
         hours, rem = divmod(int(remaining.total_seconds()), 3600)
         minutes = rem // 60
-        await ctx.send(f"⏳ You already claimed today! Come back in **{hours}h {minutes}m**.")
+        await ctx.send(f"⏳ Already claimed! Come back in **{hours}h {minutes}m**.")
         return
 
     reward = random.randint(100, 500)
     bonus = 0
-
-    # Streak bonus (basic implementation)
     if last_claim and (now - last_claim).total_seconds() < 172800:
         bonus = random.randint(50, 150)
         reward += bonus
@@ -610,10 +648,8 @@ async def daily(ctx):
 
 @bot.command(name="work")
 async def work(ctx):
-    """Work to earn some coins (1 hour cooldown)"""
+    """Work to earn coins (1 hour cooldown)"""
     uid = str(ctx.author.id)
-
-    # Use XP cooldown storage for work too
     work_key = f"work_{uid}"
     now = datetime.now()
     last_work = xp_cooldowns.get(work_key)
@@ -621,7 +657,7 @@ async def work(ctx):
     if last_work and (now - last_work).total_seconds() < 3600:
         remaining = 3600 - (now - last_work).total_seconds()
         minutes = int(remaining // 60)
-        await ctx.send(f"😅 You're tired! Rest for **{minutes} more minutes** before working again.")
+        await ctx.send(f"😅 You're tired! Rest for **{minutes} more minutes**.")
         return
 
     xp_cooldowns[work_key] = now
@@ -647,7 +683,7 @@ async def work(ctx):
 
 @bot.command(name="deposit", aliases=["dep"])
 async def deposit(ctx, amount: str):
-    """Deposit coins into your bank. Use 'all' to deposit everything."""
+    """Deposit coins into your bank. Usage: !deposit 500 or !deposit all"""
     uid = str(ctx.author.id)
     data = get_economy(uid)
 
@@ -667,12 +703,12 @@ async def deposit(ctx, amount: str):
     data["coins"] -= amount
     data["bank"] += amount
     save_economy(economy_data)
-    await ctx.send(f"🏦 Deposited **{amount} coins** into your bank!\nWallet: {data['coins']} | Bank: {data['bank']}")
+    await ctx.send(f"🏦 Deposited **{amount} coins**!\nWallet: {data['coins']} | Bank: {data['bank']}")
 
 
 @bot.command(name="withdraw", aliases=["with"])
 async def withdraw(ctx, amount: str):
-    """Withdraw coins from your bank. Use 'all' to withdraw everything."""
+    """Withdraw coins from your bank. Usage: !withdraw 200 or !withdraw all"""
     uid = str(ctx.author.id)
     data = get_economy(uid)
 
@@ -692,12 +728,12 @@ async def withdraw(ctx, amount: str):
     data["bank"] -= amount
     data["coins"] += amount
     save_economy(economy_data)
-    await ctx.send(f"💸 Withdrew **{amount} coins** from your bank!\nWallet: {data['coins']} | Bank: {data['bank']}")
+    await ctx.send(f"💸 Withdrew **{amount} coins**!\nWallet: {data['coins']} | Bank: {data['bank']}")
 
 
 @bot.command(name="gamble")
 async def gamble(ctx, amount: int):
-    """Gamble your coins for a chance to double them! (or lose them)"""
+    """Gamble your coins! Usage: !gamble 500"""
     uid = str(ctx.author.id)
     data = get_economy(uid)
 
@@ -712,14 +748,13 @@ async def gamble(ctx, amount: int):
         return
 
     roll = random.random()
-    if roll > 0.45:  # 55% chance to lose
+    if roll > 0.45:
         data["coins"] -= amount
         result = f"💸 You lost **{amount} coins**! Better luck next time..."
         color = discord.Color.red()
     else:
-        winnings = amount * 2
         data["coins"] += amount
-        result = f"🎰 You won **{winnings} coins**! You're on fire! 🔥"
+        result = f"🎰 You won **{amount * 2} coins**! You're on fire! 🔥"
         color = discord.Color.green()
 
     save_economy(economy_data)
@@ -733,7 +768,7 @@ async def gamble(ctx, amount: int):
 @bot.command(name="warn")
 @commands.has_permissions(manage_messages=True)
 async def warn(ctx, member: discord.Member, *, reason: str = "No reason given"):
-    """Warn a member"""
+    """Warn a member. Usage: !warn @member reason"""
     uid = str(member.id)
     if uid not in warnings_data:
         warnings_data[uid] = []
@@ -761,7 +796,7 @@ async def warn(ctx, member: discord.Member, *, reason: str = "No reason given"):
 
 @bot.command(name="warnings")
 async def show_warnings(ctx, member: discord.Member = None):
-    """Show warnings for a member"""
+    """Show warnings for a member. Usage: !warnings [@member]"""
     member = member or ctx.author
     uid = str(member.id)
     user_warnings = warnings_data.get(uid, [])
@@ -783,7 +818,7 @@ async def show_warnings(ctx, member: discord.Member = None):
 @bot.command(name="clearwarnings")
 @commands.has_permissions(administrator=True)
 async def clear_warnings(ctx, member: discord.Member):
-    """Clear all warnings for a member (Admin only)"""
+    """Clear all warnings for a member (Admin only). Usage: !clearwarnings @member"""
     uid = str(member.id)
     warnings_data[uid] = []
     save_warnings(warnings_data)
@@ -807,7 +842,7 @@ async def purge(ctx, amount: int):
 
 @bot.command(name="8ball")
 async def eight_ball(ctx, *, question: str):
-    """Ask the magic 8-ball a question"""
+    """Ask the magic 8-ball. Usage: !8ball Will I win today?"""
     responses = [
         "🎱 It is certain.", "🎱 Without a doubt.", "🎱 Yes, definitely!",
         "🎱 You may rely on it.", "🎱 As I see it, yes.", "🎱 Most likely.",
@@ -824,23 +859,21 @@ async def eight_ball(ctx, *, question: str):
 
 @bot.command(name="roll")
 async def roll(ctx, dice: str = "1d6"):
-    """Roll dice. Usage: !roll 2d6, !roll 1d20, etc."""
+    """Roll dice. Usage: !roll 2d6"""
     try:
         parts = dice.lower().split("d")
         num_dice = int(parts[0]) if parts[0] else 1
         sides = int(parts[1])
 
         if num_dice < 1 or num_dice > 20 or sides < 2 or sides > 100:
-            await ctx.send("❌ Use between 1-20 dice with 2-100 sides.")
+            await ctx.send("❌ Use 1–20 dice with 2–100 sides.")
             return
 
         rolls = [random.randint(1, sides) for _ in range(num_dice)]
-        total = sum(rolls)
-
         embed = discord.Embed(title="🎲 Dice Roll", color=discord.Color.blue())
         embed.add_field(name="Dice", value=f"**{dice}**", inline=True)
         embed.add_field(name="Rolls", value=f"{rolls}", inline=True)
-        embed.add_field(name="Total", value=f"**{total}**", inline=True)
+        embed.add_field(name="Total", value=f"**{sum(rolls)}**", inline=True)
         await ctx.send(embed=embed)
     except (ValueError, IndexError):
         await ctx.send("❌ Invalid format! Use: `!roll 2d6`")
@@ -855,28 +888,25 @@ async def coinflip(ctx):
 
 @bot.command(name="rps")
 async def rock_paper_scissors(ctx, choice: str):
-    """Play Rock Paper Scissors! Usage: !rps rock/paper/scissors"""
+    """Play Rock Paper Scissors. Usage: !rps rock"""
     choice = choice.lower()
     options = ["rock", "paper", "scissors"]
     emojis = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
 
     if choice not in options:
-        await ctx.send("❌ Choose: rock, paper, or scissors!")
+        await ctx.send("❌ Choose: `rock`, `paper`, or `scissors`!")
         return
 
     bot_choice = random.choice(options)
 
     if choice == bot_choice:
-        result = "It's a tie! 🤝"
-        color = discord.Color.gold()
+        result, color = "It's a tie! 🤝", discord.Color.gold()
     elif (choice == "rock" and bot_choice == "scissors") or \
          (choice == "paper" and bot_choice == "rock") or \
          (choice == "scissors" and bot_choice == "paper"):
-        result = "You win! 🎉"
-        color = discord.Color.green()
+        result, color = "You win! 🎉", discord.Color.green()
     else:
-        result = "I win! 😈"
-        color = discord.Color.red()
+        result, color = "I win! 😈", discord.Color.red()
 
     embed = discord.Embed(title="✊ Rock Paper Scissors", description=result, color=color)
     embed.add_field(name="Your choice", value=emojis[choice], inline=True)
@@ -886,7 +916,7 @@ async def rock_paper_scissors(ctx, choice: str):
 
 @bot.command(name="trivia")
 async def trivia(ctx):
-    """Answer a random trivia question (30 second timer)"""
+    """Answer a random trivia question for coins!"""
     questions = [
         ("What planet is known as the Red Planet?", "mars"),
         ("What is the capital of France?", "paris"),
@@ -897,7 +927,7 @@ async def trivia(ctx):
         ("How many bones are in the adult human body?", "206"),
         ("What is the largest ocean?", "pacific"),
         ("In what year did World War 2 end?", "1945"),
-        ("What gas do plants absorb?", "co2"),
+        ("What gas do plants absorb from the air?", "co2"),
     ]
 
     q, answer = random.choice(questions)
@@ -915,9 +945,11 @@ async def trivia(ctx):
             data = get_economy(str(msg.author.id))
             data["coins"] += reward
             save_economy(economy_data)
-            await ctx.send(f"✅ **{msg.author.display_name}** got it right! The answer was **{answer}**! +{reward} coins 🪙")
+            await ctx.send(
+                f"✅ **{msg.author.display_name}** got it right! The answer was **{answer}**! +{reward} coins 🪙"
+            )
         else:
-            await ctx.send(f"❌ Wrong! The correct answer was **{answer}**. Better luck next time!")
+            await ctx.send(f"❌ Wrong! The correct answer was **{answer}**.")
     except asyncio.TimeoutError:
         await ctx.send(f"⏰ Time's up! The answer was **{answer}**.")
 
@@ -928,10 +960,14 @@ async def meme(ctx):
     subreddits = ["memes", "dankmemes", "me_irl", "funny"]
     sub = random.choice(subreddits)
     try:
-        response = requests.get(
-            f"https://www.reddit.com/r/{sub}/random.json",
-            headers={"User-agent": "DiscordBot/1.0"},
-            timeout=5
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            functools.partial(
+                requests.get,
+                f"https://www.reddit.com/r/{sub}/random.json",
+                headers={"User-agent": "DiscordBot/1.0"},
+                timeout=5
+            )
         )
         data = response.json()
         post = data[0]["data"]["children"][0]["data"]
@@ -961,7 +997,7 @@ async def text_poll(ctx, *, question: str):
 
 @bot.command(name="avatar")
 async def avatar(ctx, member: discord.Member = None):
-    """Get someone's avatar in full size"""
+    """Get someone's avatar. Usage: !avatar [@member]"""
     member = member or ctx.author
     embed = discord.Embed(title=f"🖼️ {member.display_name}'s Avatar", color=discord.Color.blurple())
     embed.set_image(url=member.display_avatar.url)
@@ -970,7 +1006,7 @@ async def avatar(ctx, member: discord.Member = None):
 
 @bot.command(name="serverinfo")
 async def server_info(ctx):
-    """Show information about the server"""
+    """Show server information"""
     guild = ctx.guild
     embed = discord.Embed(title=f"📋 {guild.name}", color=discord.Color.blurple())
     embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
@@ -985,7 +1021,7 @@ async def server_info(ctx):
 
 @bot.command(name="userinfo")
 async def user_info(ctx, member: discord.Member = None):
-    """Show information about a user"""
+    """Show user information. Usage: !userinfo [@member]"""
     member = member or ctx.author
     roles = [r.mention for r in member.roles if r.name != "@everyone"]
     embed = discord.Embed(title=f"👤 {member.display_name}", color=member.color)
@@ -1001,7 +1037,7 @@ async def user_info(ctx, member: discord.Member = None):
 @bot.command(name="say")
 @commands.has_permissions(manage_messages=True)
 async def say(ctx, *, message: str):
-    """Make the bot say something (Manage Messages required)"""
+    """Make the bot say something (Mod only). Usage: !say Hello!"""
     await ctx.message.delete()
     await ctx.send(message)
 
@@ -1009,7 +1045,7 @@ async def say(ctx, *, message: str):
 @bot.command(name="embed")
 @commands.has_permissions(manage_messages=True)
 async def send_embed(ctx, title: str, *, description: str):
-    """Send a fancy embed message. Usage: !embed "Title" Description text here"""
+    """Send a formatted embed (Mod only). Usage: !embed "Title" Description"""
     embed = discord.Embed(title=title, description=description, color=discord.Color.blurple())
     embed.set_footer(text=f"Posted by {ctx.author.display_name}")
     await ctx.message.delete()
@@ -1020,60 +1056,63 @@ async def send_embed(ctx, title: str, *, description: str):
 
 @bot.command(name="help")
 async def help_command(ctx, command: str = None):
-    """Show all commands, or detailed usage for a specific one."""
+    """Show all commands or detailed help for one. Usage: !help [command]"""
 
     command_details = {
-        "addevent":      ('!addevent "Name" YYYY-MM-DD HH:MM @mention [repeat_days]', 'Schedule an event with an auto reminder 10 mins before.\nExample: `!addevent "Raid Night" 2026-03-10 20:00 @everyone 7`'),
-        "listevents":    ('!listevents', 'Show all upcoming events with countdown timers.'),
-        "deleteevent":   ('!deleteevent 2', 'Delete event #2 from the !listevents list.'),
-        "rank":          ('!rank [@member]', 'Check your XP, level, and progress bar. Mention someone to check theirs.'),
-        "leaderboard":   ('!leaderboard', 'Top 10 most active members by XP. Alias: !lb'),
-        "balance":       ('!balance [@member]', 'Check wallet + bank coins. Alias: !bal'),
-        "daily":         ('!daily', 'Claim 100–500 free coins once every 24 hours. Consecutive days give a bonus.'),
-        "work":          ('!work', 'Earn 30–200 coins. 1 hour cooldown.'),
-        "deposit":       ('!deposit 500  or  !deposit all', 'Move coins from wallet into your bank. Alias: !dep'),
-        "withdraw":      ('!withdraw 200  or  !withdraw all', 'Move coins from bank to wallet. Alias: !with'),
-        "gamble":        ('!gamble 500', 'Bet up to 10,000 coins. 45% chance to double, 55% to lose.'),
-        "8ball":         ('!8ball Will I win today?', 'Ask the magic 8-ball any yes/no question.'),
-        "roll":          ('!roll 2d6', 'Roll dice. Supports 1–20 dice with 2–100 sides. Default: 1d6'),
-        "coinflip":      ('!coinflip', 'Flip a coin. Heads or tails. Alias: !flip'),
-        "rps":           ('!rps rock', 'Play Rock Paper Scissors. Options: rock / paper / scissors'),
-        "trivia":        ('!trivia', 'Answer a trivia question in 30s. Correct answer earns 50–150 coins.'),
-        "meme":          ('!meme', 'Fetch a random meme from Reddit.'),
-        "poll":          ('!poll Is hot dog a sandwich?', 'Create a quick ✅ ❌ 🤷 reaction poll.'),
-        "imagepoll":     ('!imagepoll "Title" url1 url2 [url3] [url4] [duration_mins]', 'Create a poll with images. Users click buttons to vote.'),
-        "avatar":        ('!avatar [@member]', "Get a full-size version of someone's avatar."),
-        "serverinfo":    ('!serverinfo', 'Show stats about this server.'),
-        "userinfo":      ('!userinfo [@member]', 'Show account info, join date, and roles for a member.'),
-        "warn":          ('!warn @member reason', '⚠️ Mod only. Warn a member and DM them the reason.'),
-        "warnings":      ('!warnings [@member]', 'Show the last 5 warnings for a member.'),
-        "clearwarnings": ('!clearwarnings @member', '🔒 Admin only. Clear all warnings for a member.'),
-        "purge":         ('!purge 15', '⚠️ Mod only. Bulk delete up to 100 messages in the channel.'),
-        "toggleintruder":('!toggleintruder', '⚠️ Mod only. Toggle the intruder alert system on/off.'),
-        "say":           ('!say Hello everyone!', '⚠️ Mod only. Make the bot send a message (deletes your command).'),
-        "embed":         ('!embed "Title" Description here', '⚠️ Mod only. Send a formatted embed message.'),
+        "addevent":       ('!addevent "Name" YYYY-MM-DD HH:MM @mention [repeat_days]', 'Schedule an event with an auto reminder 10 mins before.\nExample: `!addevent "Raid Night" 2026-03-10 20:00 @everyone 7`'),
+        "listevents":     ('!listevents', 'Show all upcoming events with countdown timers.'),
+        "deleteevent":    ('!deleteevent 2', 'Delete event #2 from the !listevents list.'),
+        "rank":           ('!rank [@member]', 'Check your XP, level, and progress bar. Mention someone to check theirs.'),
+        "leaderboard":    ('!leaderboard', 'Top 10 most active members by XP. Alias: !lb'),
+        "balance":        ('!balance [@member]', 'Check wallet + bank coins. Alias: !bal'),
+        "daily":          ('!daily', 'Claim 100–500 free coins once every 24 hours. Consecutive days give a streak bonus.'),
+        "work":           ('!work', 'Earn 30–200 coins. 1 hour cooldown.'),
+        "deposit":        ('!deposit 500  or  !deposit all', 'Move coins from wallet into your bank. Alias: !dep'),
+        "withdraw":       ('!withdraw 200  or  !withdraw all', 'Move coins from bank to wallet. Alias: !with'),
+        "gamble":         ('!gamble 500', 'Bet up to 10,000 coins. 45% chance to double, 55% to lose.'),
+        "8ball":          ('!8ball Will I win today?', 'Ask the magic 8-ball any yes/no question.'),
+        "roll":           ('!roll 2d6', 'Roll dice. Supports 1–20 dice with 2–100 sides. Default: 1d6'),
+        "coinflip":       ('!coinflip', 'Flip a coin. Heads or tails. Alias: !flip'),
+        "rps":            ('!rps rock', 'Play Rock Paper Scissors. Options: rock / paper / scissors'),
+        "trivia":         ('!trivia', 'Answer a trivia question in 30 seconds. Correct answer earns 50–150 coins.'),
+        "meme":           ('!meme', 'Fetch a random meme from Reddit.'),
+        "poll":           ('!poll Is hot dog a sandwich?', 'Create a quick ✅ ❌ 🤷 reaction poll.'),
+        "imagepoll":      ('!imagepoll "Title" url1 url2 [url3] [url4] [duration_mins]', 'Create a poll with images. Users click buttons to vote.'),
+        "avatar":         ('!avatar [@member]', "Get a full-size version of someone's avatar."),
+        "serverinfo":     ('!serverinfo', 'Show stats about this server.'),
+        "userinfo":       ('!userinfo [@member]', 'Show account info, join date, and roles for a member.'),
+        "warn":           ('!warn @member reason', '⚠️ Mod only. Warn a member and DM them the reason.'),
+        "warnings":       ('!warnings [@member]', 'Show the last 5 warnings for a member.'),
+        "clearwarnings":  ('!clearwarnings @member', '🔒 Admin only. Clear all warnings for a member.'),
+        "purge":          ('!purge 15', '⚠️ Mod only. Bulk delete up to 100 messages in the channel.'),
+        "toggleintruder": ('!toggleintruder', '⚠️ Mod only. Toggle the intruder alert system on/off.'),
+        "say":            ('!say Hello everyone!', '⚠️ Mod only. Make the bot send a message (deletes your command).'),
+        "embed":          ('!embed "Title" Description here', '⚠️ Mod only. Send a formatted embed message.'),
     }
 
     if command:
-        command = command.lower().lstrip("!")
-        if command not in command_details:
-            await ctx.send(f"❓ Unknown command `{command}`. Use `!help` to see all commands.")
+        cmd = command.lower().lstrip("!")
+        if cmd not in command_details:
+            await ctx.send(f"❓ Unknown command `{cmd}`. Use `!help` to see all commands.")
             return
-        usage, description = command_details[command]
-        embed = discord.Embed(title=f"📖 !{command}", color=discord.Color.blurple())
+        usage, description = command_details[cmd]
+        embed = discord.Embed(title=f"📖 !{cmd}", color=discord.Color.blurple())
         embed.add_field(name="Usage", value=f"`{usage}`", inline=False)
         embed.add_field(name="Description", value=description, inline=False)
         await ctx.send(embed=embed)
         return
 
-    # Overview
-    embed = discord.Embed(title="🤖 Bot Commands", description="Use `!help <command>` for detailed usage.\nExample: `!help gamble`", color=discord.Color.blurple())
-    embed.add_field(name="📅 Events",      value="`addevent` `listevents` `deleteevent`", inline=False)
-    embed.add_field(name="📊 XP & Levels", value="`rank` `leaderboard`", inline=False)
-    embed.add_field(name="💰 Economy",     value="`balance` `daily` `work` `deposit` `withdraw` `gamble`", inline=False)
-    embed.add_field(name="🎮 Fun",         value="`8ball` `roll` `coinflip` `rps` `trivia` `meme` `poll` `imagepoll`", inline=False)
-    embed.add_field(name="👤 Info",        value="`avatar` `serverinfo` `userinfo`", inline=False)
-    embed.add_field(name="🛡️ Moderation", value="`warn` `warnings` `clearwarnings` `purge` `toggleintruder` `say` `embed`", inline=False)
+    embed = discord.Embed(
+        title="🤖 Bot Commands",
+        description="Use `!help <command>` for detailed usage.\nExample: `!help gamble`",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="📅 Events",       value="`addevent` `listevents` `deleteevent`", inline=False)
+    embed.add_field(name="📊 XP & Levels",  value="`rank` `leaderboard`", inline=False)
+    embed.add_field(name="💰 Economy",      value="`balance` `daily` `work` `deposit` `withdraw` `gamble`", inline=False)
+    embed.add_field(name="🎮 Fun",          value="`8ball` `roll` `coinflip` `rps` `trivia` `meme` `poll` `imagepoll`", inline=False)
+    embed.add_field(name="👤 Info",         value="`avatar` `serverinfo` `userinfo`", inline=False)
+    embed.add_field(name="🛡️ Moderation",  value="`warn` `warnings` `clearwarnings` `purge` `toggleintruder` `say` `embed`", inline=False)
     embed.set_footer(text="⚠️ = requires moderator/admin permissions")
     await ctx.send(embed=embed)
 
@@ -1087,11 +1126,13 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send("❌ Member not found!")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"❌ Missing argument! Use `!help` to see correct usage.")
+        await ctx.send(f"❌ Missing argument! Use `!help {ctx.command}` to see correct usage.")
     elif isinstance(error, commands.CommandNotFound):
-        pass  # Silently ignore unknown commands
+        pass
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(f"❌ Invalid argument! Use `!help {ctx.command}` to see correct usage.")
     else:
-        print(f"Unhandled error: {error}")
+        print(f"Unhandled error in {ctx.command}: {error}")
 
 
 # =============== START FLASK + BOT TOGETHER ===============
