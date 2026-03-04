@@ -34,15 +34,18 @@ def run_flask():
 # =============== DISCORD BOT SETUP ===============
 
 load_dotenv()
-
 TOKEN = os.getenv("TOKEN")
-print(f"Token loaded: {'YES' if TOKEN else 'NO - TOKEN IS NONE'}")
+
+# Fix for asyncio on Linux servers (like Render)
+import sys
+if sys.platform != "win32":
+    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 # =============== RATE LIMIT HANDLER ===============
@@ -1140,5 +1143,15 @@ async def on_command_error(ctx, error):
 # =============== START FLASK + BOT TOGETHER ===============
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    bot.run(TOKEN)
+    # Flask runs in background thread, bot runs on main thread (required for asyncio)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print("🌐 Flask thread started")
+    
+    # Small delay to let Flask bind to port before bot starts
+    # (Render health-checks the port immediately on deploy)
+    import time
+    time.sleep(2)
+    
+    print("🤖 Starting Discord bot...")
+    bot.run(TOKEN, log_handler=None)
