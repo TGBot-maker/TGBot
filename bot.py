@@ -224,7 +224,10 @@ async def before_check_events():
 @bot.event
 async def on_ready():
     print(f"✅ Bot is online as {bot.user}")
-    check_events.start()
+
+    if not check_events.is_running():
+        check_events.start()
+
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.watching, name="over the server 👀")
     )
@@ -1137,8 +1140,5 @@ async def on_command_error(ctx, error):
 # =============== START FLASK + BOT TOGETHER ===============
 
 if __name__ == "__main__":
-    print("🌐 Starting Flask thread...")
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print("🤖 Starting Discord bot...")
-    bot.run(TOKEN)
+    threading.Thread(target=run_flask).start()
+    bot.run(TOKEN, reconnect=True)
