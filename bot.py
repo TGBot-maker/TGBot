@@ -1,3 +1,15 @@
+import traceback
+try:
+    import discord
+    from discord.ext import commands, tasks
+    from dotenv import load_dotenv
+    from flask import Flask
+    from PIL import Image, ImageDraw, ImageFont
+    import requests
+    print("✅ All imports successful")
+except Exception as e:
+    print(f"❌ IMPORT ERROR: {e}")
+    traceback.print_exc()
 import os
 import threading
 import asyncio
