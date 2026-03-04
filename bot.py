@@ -1154,16 +1154,11 @@ async def on_command_error(ctx, error):
 
 # =============== START FLASK + BOT TOGETHER ===============
 
+# =============== START FLASK + BOT TOGETHER ===============
+
 if __name__ == "__main__":
-    # Flask runs in background thread, bot runs on main thread (required for asyncio)
+    print("🌐 Starting Flask thread...")
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    print("🌐 Flask thread started")
-    
-    # Small delay to let Flask bind to port before bot starts
-    # (Render health-checks the port immediately on deploy)
-    import time
-    time.sleep(2)
-    
     print("🤖 Starting Discord bot...")
-    bot.run(TOKEN, log_handler=None)
+    bot.run(TOKEN)
