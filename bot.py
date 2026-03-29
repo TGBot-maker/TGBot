@@ -77,25 +77,6 @@ def save_events(events):
 events = load_events()
 
 
-# =============== XP / LEVEL STORAGE ===============
-
-XP_FILE = "xp.json"
-
-def load_xp():
-    if os.path.exists(XP_FILE):
-        with open(XP_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_xp(data):
-    with open(XP_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-xp_data = load_xp()
-xp_cooldowns = {}       # user_id -> last message timestamp
-xp_save_counter = 0     # batch disk writes every 10 XP gains
-
-
 # =============== ECONOMY STORAGE ===============
 
 ECONOMY_FILE = "economy.json"
@@ -143,23 +124,18 @@ active_polls = {}
 
 # =============== HELPER FUNCTIONS ===============
 
-def get_level(xp):
-    return int((xp / 100) ** 0.5)
-
-def xp_for_next_level(level):
-    return ((level + 1) ** 2) * 100
+# Specific users to react to
+TARGET_USERS = {
+    "pippi.111",
+    "Pippi",
+    1411306732491112488  # User ID
+}
 
 def get_economy(user_id):
     uid = str(user_id)
     if uid not in economy_data:
         economy_data[uid] = {"coins": 0, "bank": 0}
     return economy_data[uid]
-
-def get_xp_data(user_id):
-    uid = str(user_id)
-    if uid not in xp_data:
-        xp_data[uid] = {"xp": 0, "level": 0, "messages": 0}
-    return xp_data[uid]
 
 
 # =============== EVENT CHECKER TASK ===============
@@ -271,11 +247,11 @@ async def on_member_join(member):
             await channel.send(embed=embed)
 
 
-# =============== ON MESSAGE — XP + INTRUDER ===============
+# =============== ON MESSAGE — INTRUDER + PIPPI REACTIONS ===============
 
 @bot.event
 async def on_message(message):
-    global intruder_alert_enabled, intruder_count, xp_save_counter
+    global intruder_alert_enabled, intruder_count
 
     if message.author.bot:
         await bot.process_commands(message)
@@ -298,34 +274,13 @@ async def on_message(message):
             await bot.process_commands(message)
             return
 
-    # XP gain (1 minute cooldown per user)
-    if message.guild:
-        uid = str(message.author.id)
-        now = datetime.now()
-        last = xp_cooldowns.get(uid)
-
-        if last is None or (now - last).total_seconds() >= 60:
-            xp_cooldowns[uid] = now
-            data = get_xp_data(uid)
-            gained = random.randint(15, 25)
-            data["xp"] += gained
-            data["messages"] += 1
-            old_level = data["level"]
-            new_level = get_level(data["xp"])
-            data["level"] = new_level
-
-            # Batch disk writes — only save every 10 XP gains
-            xp_save_counter += 1
-            if xp_save_counter >= 10:
-                save_xp(xp_data)
-                xp_save_counter = 0
-
-            if new_level > old_level:
-                save_xp(xp_data)  # always save immediately on level up
-                xp_save_counter = 0
-                await message.channel.send(
-                    f"🎉 **LEVEL UP!** {message.author.mention} just reached **Level {new_level}**! 🚀"
-                )
+    # React to specific users
+    if message.author.id in TARGET_USERS or message.author.name in TARGET_USERS:
+        try:
+            await message.add_reaction("😒")  # :unamused:
+            await message.add_reaction("🐰")  # :rabbit:
+        except Exception as e:
+            print(f"Could not add reaction: {e}")
 
     await bot.process_commands(message)
 
@@ -549,53 +504,6 @@ async def image_poll(ctx, title: str, img1: str, img2: str, img3: str = None, im
 
     if duration:
         bot.loop.create_task(close_image_poll(msg.id, duration))
-
-
-# =============== XP / LEVELING COMMANDS ===============
-
-@bot.command(name="rank")
-async def rank(ctx, member: discord.Member = None):
-    """Check your rank or someone else's. Usage: !rank [@member]"""
-    member = member or ctx.author
-    data = get_xp_data(str(member.id))
-
-    level = data["level"]
-    xp = data["xp"]
-    next_lvl_xp = xp_for_next_level(level)
-    progress = min(int((xp / next_lvl_xp) * 20), 20)
-    bar = "█" * progress + "░" * (20 - progress)
-
-    embed = discord.Embed(title=f"📊 {member.display_name}'s Rank", color=discord.Color.purple())
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Level", value=f"**{level}**", inline=True)
-    embed.add_field(name="XP", value=f"**{xp}** / {next_lvl_xp}", inline=True)
-    embed.add_field(name="Messages", value=f"**{data['messages']}**", inline=True)
-    embed.add_field(name="Progress", value=f"`[{bar}]`", inline=False)
-    await ctx.send(embed=embed)
-
-
-@bot.command(name="leaderboard", aliases=["lb"])
-async def leaderboard(ctx):
-    """Show the top 10 most active members"""
-    if not xp_data:
-        await ctx.send("No XP data yet!")
-        return
-
-    sorted_users = sorted(xp_data.items(), key=lambda x: x[1].get("xp", 0), reverse=True)[:10]
-    embed = discord.Embed(title="🏆 Server Leaderboard", color=discord.Color.gold())
-    medals = ["🥇", "🥈", "🥉"]
-
-    for i, (uid, data) in enumerate(sorted_users):
-        member = ctx.guild.get_member(int(uid))
-        name = member.display_name if member else f"User {uid}"
-        medal = medals[i] if i < 3 else f"**#{i+1}**"
-        embed.add_field(
-            name=f"{medal} {name}",
-            value=f"Level {data.get('level', 0)} — {data.get('xp', 0)} XP",
-            inline=False
-        )
-
-    await ctx.send(embed=embed)
 
 
 # =============== ECONOMY COMMANDS ===============
@@ -1062,8 +970,6 @@ async def help_command(ctx, command: str = None):
         "addevent":       ('!addevent "Name" YYYY-MM-DD HH:MM @mention [repeat_days]', 'Schedule an event with an auto reminder 10 mins before.\nExample: `!addevent "Raid Night" 2026-03-10 20:00 @everyone 7`'),
         "listevents":     ('!listevents', 'Show all upcoming events with countdown timers.'),
         "deleteevent":    ('!deleteevent 2', 'Delete event #2 from the !listevents list.'),
-        "rank":           ('!rank [@member]', 'Check your XP, level, and progress bar. Mention someone to check theirs.'),
-        "leaderboard":    ('!leaderboard', 'Top 10 most active members by XP. Alias: !lb'),
         "balance":        ('!balance [@member]', 'Check wallet + bank coins. Alias: !bal'),
         "daily":          ('!daily', 'Claim 100–500 free coins once every 24 hours. Consecutive days give a streak bonus.'),
         "work":           ('!work', 'Earn 30–200 coins. 1 hour cooldown.'),
@@ -1108,8 +1014,7 @@ async def help_command(ctx, command: str = None):
         color=discord.Color.blurple()
     )
     embed.add_field(name="📅 Events",       value="`addevent` `listevents` `deleteevent`", inline=False)
-    embed.add_field(name="📊 XP & Levels",  value="`rank` `leaderboard`", inline=False)
-    embed.add_field(name="💰 Economy",      value="`balance` `daily` `work` `deposit` `withdraw` `gamble`", inline=False)
+    embed.add_field(name=" Economy",      value="`balance` `daily` `work` `deposit` `withdraw` `gamble`", inline=False)
     embed.add_field(name="🎮 Fun",          value="`8ball` `roll` `coinflip` `rps` `trivia` `meme` `poll` `imagepoll`", inline=False)
     embed.add_field(name="👤 Info",         value="`avatar` `serverinfo` `userinfo`", inline=False)
     embed.add_field(name="🛡️ Moderation",  value="`warn` `warnings` `clearwarnings` `purge` `toggleintruder` `say` `embed`", inline=False)
