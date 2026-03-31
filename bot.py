@@ -124,13 +124,6 @@ active_polls = {}
 
 # =============== HELPER FUNCTIONS ===============
 
-# Specific users to react to
-TARGET_USERS = {
-    "pippi.111",
-    "Pippi",
-    1411306732491112488  # User ID
-}
-
 def get_economy(user_id):
     uid = str(user_id)
     if uid not in economy_data:
@@ -274,13 +267,7 @@ async def on_message(message):
             await bot.process_commands(message)
             return
 
-    # React to specific users
-    if message.author.id in TARGET_USERS or message.author.name in TARGET_USERS:
-        try:
-            await message.add_reaction("😒")  # :unamused:
-            await message.add_reaction("🐰")  # :rabbit:
-        except Exception as e:
-            print(f"Could not add reaction: {e}")
+
 
     await bot.process_commands(message)
 
